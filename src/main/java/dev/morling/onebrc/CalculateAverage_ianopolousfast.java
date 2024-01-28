@@ -24,6 +24,7 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.nio.ByteOrder;
 import java.nio.channels.*;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -49,6 +50,7 @@ public class CalculateAverage_ianopolousfast {
     public static final int MAX_LINE_LENGTH = 107;
     public static final int MAX_STATIONS = 1 << 14;
     private static final OfLong LONG_LAYOUT = JAVA_LONG_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
+    private static final OfLong LONG_LAYOUT_LE = JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
     private static final VectorSpecies<Byte> BYTE_SPECIES = ByteVector.SPECIES_PREFERRED.length() >= 32
             ? ByteVector.SPECIES_256
             : ByteVector.SPECIES_128;
@@ -149,23 +151,44 @@ public class CalculateAverage_ianopolousfast {
         return ((d & 0xff00000000000000L) ^ 0x2d00000000000000L) != 0 ? 0 : (short) -1;
     }
 
-    public static long processTemperature(long lineSplit, int size, MemorySegment buffer, Stat station) {
-        long d = buffer.get(LONG_LAYOUT, lineSplit);
-        // negative is either 0 or -1
-        short negative = getMinus(d);
-        d = d << (negative * -8);
-        int dotIndex = size - 2 + negative;
-        d = (d >> 8) | 0x30000000_00000000L; // add a leading 0 digit
-        d = d >> 8 * (5 - dotIndex);
-        short temperature = (short) ((byte) d - '0' +
-                10 * (((byte) (d >> 16)) - '0') +
-                100 * (((byte) (d >> 24)) - '0'));
-        temperature = (short) ((temperature ^ negative) - negative); // negative treatment inspired by merkitty
-        station.add(temperature);
-        return lineSplit + size + 1;
+    private static final long PERFECT_HASH_SEED = -1982870890352534081L;
+    static final short[] temperatureLookup = new short[5003];
+    static {
+        long t0 = System.currentTimeMillis();
+        for (int i = -999; i < 1000; i++) {
+            String s = Integer.toString(i);
+            String withDot = s.substring(0, s.length() - 1) +
+                    (Math.abs(i) < 10 ? "0" : "") +
+                    "." +
+                    s.charAt(s.length() - 1);
+
+            byte[] bytes = withDot.getBytes(StandardCharsets.UTF_8);
+            MemorySegment mem = MemorySegment.ofArray(Arrays.copyOfRange(bytes, 0, 8));
+            long d = mem.get(LONG_LAYOUT_LE, 0);
+            long hash = (d * PERFECT_HASH_SEED) & ~(1L << 63);
+            int index = (int) (hash % temperatureLookup.length);
+            if (temperatureLookup[index] != 0)
+                throw new IllegalStateException("Perfect hash is not perfect!");
+            temperatureLookup[index] = (short) i;
+        }
+        long t1 = System.currentTimeMillis();
+        // System.out.println(t1 - t0);
     }
 
-    private static long parseLine(long lineStart, MemorySegment buffer, Stat[] stations) {
+    private static ThreadLocal<short[]> temperatures = ThreadLocal.withInitial(() -> Arrays.copyOfRange(temperatureLookup, 0, temperatureLookup.length));
+
+    public static long processTemperature(long lineSplit, int newLineIndex, MemorySegment buffer, Stat station, short[] temperatures) {
+        long d = buffer.get(LONG_LAYOUT_LE, lineSplit);
+        int reverseNewlineIndex = 8 - newLineIndex;
+        d = d & (-1L >>> (8 * reverseNewlineIndex));
+        long hash = (d * PERFECT_HASH_SEED) & ~(1L << 63);
+        int temperatureIndex = (int) (hash % temperatures.length);
+        short temperature = temperatures[temperatureIndex];
+        station.add(temperature);
+        return lineSplit + newLineIndex + 1;
+    }
+
+    private static long parseLine(long lineStart, MemorySegment buffer, Stat[] stations, short[] temperatures) {
         ByteVector line = ByteVector.fromMemorySegment(BYTE_SPECIES, buffer, lineStart, ByteOrder.nativeOrder());
         int lineSize = line.compare(VectorOperators.EQ, '\n').firstTrue();
         int index = lineSize;
@@ -193,7 +216,7 @@ public class CalculateAverage_ianopolousfast {
         }
         long hash = first8 ^ second8; // todo include later bytes
         Stat station = dedupeStation(lineStart, lineStart + keySize, hash, buffer, stations);
-        return processTemperature(lineStart + keySize + 1, lineSize - keySize - 1, buffer, station);
+        return processTemperature(lineStart + keySize + 1, lineSize - keySize - 1, buffer, station, temperatures);
     }
 
     public static Stat[] parseStats(long startByte, long endByte, MemorySegment buffer) {
@@ -208,6 +231,7 @@ public class CalculateAverage_ianopolousfast {
         }
 
         Stat[] stations = new Stat[MAX_STATIONS];
+        short[] temperatureLookup = temperatures.get();
 
         // Handle reading the very last few lines in the file
         // this allows us to not worry about reading beyond the end
@@ -233,17 +257,17 @@ public class CalculateAverage_ianopolousfast {
                     tempSize = 4;
                 if (end.get(JAVA_BYTE, index + station.namelen + 6) == '\n')
                     tempSize = 5;
-                index = (int) processTemperature(index + station.namelen + 1, tempSize, end, station);
+                index = (int) processTemperature(index + station.namelen + 1, tempSize, end, station, temperatureLookup);
             }
         }
 
-        innerloop(startByte, endByte, buffer, stations);
+        innerloop(startByte, endByte, buffer, stations, temperatureLookup);
         return stations;
     }
 
-    private static void innerloop(long startByte, long endByte, MemorySegment buffer, Stat[] stations) {
+    private static void innerloop(long startByte, long endByte, MemorySegment buffer, Stat[] stations, short[] temperatures) {
         while (startByte < endByte) {
-            startByte = parseLine(startByte, buffer, stations);
+            startByte = parseLine(startByte, buffer, stations, temperatures);
         }
     }
 
