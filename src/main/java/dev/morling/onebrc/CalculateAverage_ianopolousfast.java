@@ -27,6 +27,7 @@ import java.nio.channels.*;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.*;
 import java.util.*;
 
@@ -105,7 +106,11 @@ public class CalculateAverage_ianopolousfast {
         return new Stat(stationBuffer);
     }
 
-    public static Stat dedupeStation(long start, long end, long hash, MemorySegment buffer, Stat[] stations) {
+    public static Stat dedupeStation(long start, long end, MemorySegment buffer, Stat[] stations) {
+        long[] dwords = ByteVector.fromMemorySegment(BYTE_SPECIES, buffer, start, ByteOrder.BIG_ENDIAN,
+                BYTE_SPECIES.indexInRange(start, end)).reinterpretAsLongs().toLongArray();
+        long hash = dwords[0] ^ dwords[1];
+
         int index = hashToIndex(hash, MAX_STATIONS);
         Stat match = stations[index];
         while (match != null) {
@@ -119,30 +124,11 @@ public class CalculateAverage_ianopolousfast {
         return res;
     }
 
-    static long maskHighBytes(long d, int nbytes) {
-        return d & (-1L << ((8 - nbytes) * 8));
-    }
-
     public static Stat parseStation(long lineStart, MemorySegment buffer, Stat[] stations) {
         ByteVector line = ByteVector.fromMemorySegment(BYTE_SPECIES, buffer, lineStart, ByteOrder.nativeOrder());
         int keySize = line.compare(VectorOperators.EQ, ';').firstTrue();
 
-        long first8 = buffer.get(LONG_LAYOUT, lineStart);
-        long second8 = 0;
-        if (keySize <= 8) {
-            first8 = maskHighBytes(first8, keySize & 0x07);
-        }
-        else if (keySize < 16) {
-            second8 = maskHighBytes(buffer.get(LONG_LAYOUT, lineStart + 8), keySize & 0x07);
-        }
-        else if (keySize == BYTE_SPECIES.vectorByteSize()) {
-            while (buffer.get(JAVA_BYTE, lineStart + keySize) != ';') {
-                keySize++;
-            }
-            second8 = maskHighBytes(buffer.get(LONG_LAYOUT, lineStart + 8), keySize & 0x07);
-        }
-        long hash = first8 ^ second8; // todo include later bytes
-        return dedupeStation(lineStart, lineStart + keySize, hash, buffer, stations);
+        return dedupeStation(lineStart, lineStart + keySize, buffer, stations);
     }
 
     public static short getMinus(long d) {
@@ -177,22 +163,7 @@ public class CalculateAverage_ianopolousfast {
         int keySize = lineSize - 6 + ByteVector.fromMemorySegment(BYTE_SPECIES, buffer, lineStart + lineSize - 6,
                 ByteOrder.nativeOrder()).compare(VectorOperators.EQ, ';').firstTrue();
 
-        long first8 = buffer.get(LONG_LAYOUT, lineStart);
-        long second8 = 0;
-        if (keySize <= 8) {
-            first8 = maskHighBytes(first8, keySize & 0x07);
-        }
-        else if (keySize < 16) {
-            second8 = maskHighBytes(buffer.get(LONG_LAYOUT, lineStart + 8), keySize & 0x07);
-        }
-        else if (keySize == BYTE_SPECIES.vectorByteSize()) {
-            while (buffer.get(JAVA_BYTE, lineStart + keySize) != ';') {
-                keySize++;
-            }
-            second8 = maskHighBytes(buffer.get(LONG_LAYOUT, lineStart + 8), keySize & 0x07);
-        }
-        long hash = first8 ^ second8; // todo include later bytes
-        Stat station = dedupeStation(lineStart, lineStart + keySize, hash, buffer, stations);
+        Stat station = dedupeStation(lineStart, lineStart + keySize, buffer, stations);
         return processTemperature(lineStart + keySize + 1, lineSize - keySize - 1, buffer, station);
     }
 
