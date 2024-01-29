@@ -87,11 +87,22 @@ public class CalculateAverage_ianopolousfast {
         return true;
     }
 
-    private static int hashToIndex(long hash, int len) {
-        // From Thomas Wuerthinger's entry
-        int hashAsInt = (int) (hash ^ (hash >>> 28));
-        int finalHash = (hashAsInt ^ (hashAsInt >>> 15));
-        return (finalHash & (len - 1));
+    private static final int GOLDEN_RATIO = 0x9E3779B9;
+    private static final int HASH_LROTATE = 5;
+
+    // hash from giovannicuccu
+    private static int hash(MemorySegment memorySegment, long start, int len) {
+        int x;
+        int y;
+        if (len >= Integer.BYTES) {
+            x = memorySegment.get(JAVA_INT_UNALIGNED, start);
+            y = memorySegment.get(JAVA_INT_UNALIGNED, start + len - Integer.BYTES);
+        }
+        else {
+            x = memorySegment.get(JAVA_BYTE, start);
+            y = memorySegment.get(JAVA_BYTE, start + len - Byte.BYTES);
+        }
+        return (Integer.rotateLeft(x * GOLDEN_RATIO, HASH_LROTATE) ^ y) * GOLDEN_RATIO;
     }
 
     public static Stat createStation(long start, long end, MemorySegment buffer) {
@@ -102,11 +113,8 @@ public class CalculateAverage_ianopolousfast {
     }
 
     public static Stat dedupeStation(long start, long end, MemorySegment buffer, Stat[] stations) {
-        long[] dwords = ByteVector.fromMemorySegment(BYTE_SPECIES, buffer, start, ByteOrder.BIG_ENDIAN,
-                BYTE_SPECIES.indexInRange(start, end)).reinterpretAsLongs().toLongArray();
-        long hash = dwords[0] ^ dwords[1];
-
-        int index = hashToIndex(hash, MAX_STATIONS);
+        int hash = hash(buffer, start, (int) (end - start));
+        int index = hash & (MAX_STATIONS - 1);
         Stat match = stations[index];
         while (match != null) {
             if (matchingStationBytes(start, end, buffer, match))
